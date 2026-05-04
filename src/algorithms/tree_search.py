@@ -871,11 +871,11 @@ def simulated_annealing(
 
 
 def build_mst_tree(G: nx.Graph, edge_scores: dict) -> nx.Graph:
-    """Build minimum spanning tree from edge scores (log(1-s) format).
+    """Build minimum spanning tree from edge scores (-log(s) format).
 
     Args:
         G: Undirected graph
-        edge_scores: Dict mapping frozenset((u,v)) -> log(1-s) weight (lower is better)
+        edge_scores: Dict mapping frozenset((u,v)) -> -log(s) weight (lower = better edge, i.e., higher s)
 
     Returns:
         MST as undirected NetworkX graph
@@ -884,7 +884,7 @@ def build_mst_tree(G: nx.Graph, edge_scores: dict) -> nx.Graph:
 
     for u, v in G.edges():
         key = frozenset((u, v))
-        # edge_scores already in log(1-s) format (lower = better edge)
+        # edge_scores in -log(s) format (lower = better edge, i.e., higher probability)
         weight = edge_scores.get(key, 0.0)
         G_weighted[u][v]["weight"] = weight
 
@@ -1016,7 +1016,7 @@ def precompute_for_manifest_entry(
                 key = frozenset((u, v))
                 if key not in seen:
                     s_rev = raw_scores.get((v, u), 0.0)
-                    edge_scores[key] = float(np.log(1.0 - max(s, s_rev) + 1e-9))
+                    edge_scores[key] = float(-np.log(max(s, s_rev) + 1e-9))
                     seen.add(key)
         except Exception:
             logging.getLogger(LOGGER_NAME).exception(
@@ -1509,7 +1509,7 @@ def main():
         choices=["positive_edges", "mst", "empty"],
         default="positive_edges",
         help="Initial tree construction method: positive_edges (use positive.pkl, default), "
-        "mst (MST with log(1-score) weights), empty (arbitrary union find tree)",
+        "mst (MST with -log(score) weights, maximum-likelihood tree), empty (arbitrary union find tree)",
     )
     parser.add_argument(
         "--max-iter",
