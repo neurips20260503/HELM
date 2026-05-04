@@ -85,7 +85,7 @@ python -m src.algorithms.tree_search \
 - `configs/sa_memetracker.json` (MemeTracker)
 
 **Key parameters:**
-- `--max-iter`: Number of iterations (default: 5M, use 0 for MST-only initialization)
+- `--max-iter`: Number of iterations (default: 5M, use 0 for MST-only without SA search)
 - `--init-method`: Tree initialization (`mst`, `positive_edges`, `empty`)
 
 **Output:** `outputs/{collection}/{graph_id}/search/tree.pkl`
