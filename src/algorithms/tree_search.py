@@ -7,7 +7,12 @@ import networkx as nx
 import leidenalg as la
 import igraph as ig
 import numpy as np
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+    _plt_available = True
+except ImportError:
+    plt = None
+    _plt_available = False
 import pandas as pd
 import time
 import src.utils as utils
@@ -1061,6 +1066,12 @@ def precompute_for_manifest_entry(
 
 def plot_loss_history(loss_history):
     """Generates a plot for loss components over iterations."""
+    if not _plt_available:
+        logging.getLogger(LOGGER_NAME).warning(
+            "matplotlib not installed; skipping loss plot. "
+            "Install with: pip install matplotlib"
+        )
+        return
     plt.figure(figsize=(10, 6))
     for key, values in loss_history.items():
         plt.plot(range(0, len(values) * 1000, 1000), values, label=key)
