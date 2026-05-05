@@ -8,30 +8,37 @@ This package contains the source code and sample data for:
 
 ## Dependencies
 
-**Core (required):**
+**Core (required for all pipeline steps):**
 
 ```bash
-pip install networkx numpy pandas scikit-learn xgboost lightgbm optuna optuna-integration[xgboost,lightgbm,pytorch-lightning]
+pip install networkx numpy pandas scikit-learn xgboost matplotlib
+pip install leidenalg igraph
 pip install graphMeasures
 pip install --upgrade networkx  # Important: upgrade after graphMeasures
 ```
 
-**GNN support (optional):**
+**Hyperparameter tuning (optional — needed for `edge_scores.py --n-trials` and `optuna_tree_search.py`):**
 
 ```bash
-pip install torch pytorch-lightning torch-geometric
+pip install optuna 'optuna-integration[xgboost,lightgbm]'
 ```
 
-**Wikipedia extraction (optional):**
+**LightGBM alternative model (optional — needed for `edge_scores.py --model lgb`):**
+
+```bash
+pip install lightgbm
+```
+
+**GNN edge scoring (optional — needed for `edge_scores_gnn.py`):**
+
+```bash
+pip install torch pytorch-lightning torch-geometric optuna
+```
+
+**Wikipedia extraction (optional — needed for `src/data_extractors/wiki_extractor.py`):**
 
 ```bash
 pip install wikipediaapi
-```
-
-**Optuna for hyperparameter tuning (optional):**
-
-```bash
-pip install optuna
 ```
 
 ## HELM Pipeline (Complete Workflow)
@@ -125,13 +132,11 @@ Tested hyperparameters for each dataset in `configs/sa_{collection}.json`:
 
 ## Optional: Hyperparameter Tuning with Optuna
 
-If you want to discover new hyperparameters for your own datasets:
+Requires the `optuna` optional dependency (see Dependencies above).
 
 ### Tune Edge Scoring Model
 
 ```bash
-pip install optuna  # If not already installed
-
 python -m src.algorithms.edge_scores \
   --manifest manifests/manifest_10_wiki_train.json \
   --collection wiki \
@@ -210,7 +215,7 @@ python -m src.algorithms.edge_scores \
 
 ### `src/algorithms/edge_scores_gnn.py`
 
-Graph Neural Network edge scoring:
+Graph Neural Network edge scoring (**requires GNN optional dependencies**, see Dependencies):
 
 **Architecture:** GINEConv with 4 layers, BatchNorm  
 **Features:** Node embeddings (from node_features.csv) + edge features  
