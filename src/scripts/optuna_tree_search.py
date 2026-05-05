@@ -6,15 +6,24 @@ import argparse
 import json
 import copy
 import tempfile
-import optuna
 import numpy as np
 import logging
-import optuna.storages.journal
 import matplotlib.pyplot as plt
 import src.utils as utils
 import src.algorithms.tree_search as tree_search_mod
 from datetime import datetime
 import concurrent.futures
+
+try:
+    import optuna
+    import optuna.storages.journal
+    _optuna_available = True
+except ImportError:
+    print(
+        "ERROR: optuna is required for hyperparameter tuning.\n"
+        "Install with: pip install optuna"
+    )
+    sys.exit(1)
 
 
 # Setup Logging is handled per-run via utils.setup_logger (do not use global basicConfig)
