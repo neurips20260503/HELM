@@ -19,6 +19,7 @@ Follows same pattern as edge_features, edge_scores, tree_search modules.
 import argparse
 import os
 import json
+import math
 import pickle
 import tempfile
 from collections import deque, defaultdict
@@ -29,6 +30,12 @@ import pandas as pd
 import networkx as nx
 from concurrent.futures import ProcessPoolExecutor
 from src.utils import load_graph, save_graph
+
+try:
+    from src.algorithms.rumor_centrality import estimate_source_exact as _rumor_estimate_source
+    _RUMOR_AVAILABLE = True
+except ImportError:
+    _RUMOR_AVAILABLE = False
 
 
 # Path policy (enforced conventions)
@@ -156,6 +163,7 @@ def find_optimal_root(
     tree_undirected: nx.Graph,
     true_tree: Optional[nx.Graph],
     use_T_depth_dist: bool = False,
+    prior_dist: Optional[List[float]] = None,
     verbose: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -163,11 +171,10 @@ def find_optimal_root(
 
     Uses optimized adjacency-dict approach for 235x speedup.
 
-    Root selection methods:
-    1. With T and use_T_depth_dist=True: Minimize MSE between predicted and T's depth distribution
-    2. Without T or use_T_depth_dist=False: Use tree height heuristic (prefer balanced/shallow trees)
-       - Heuristic: minimize tree height (max depth from root)
-       - MSE metric = tree_height for consistent API
+    Root selection methods (in priority order):
+    1. prior_dist provided: Minimize MSE against this explicit depth histogram.
+    2. use_T_depth_dist=True and T available: Minimize MSE against T's depth distribution.
+    3. Fallback: tree height heuristic (prefer balanced/shallow trees).
 
     Args:
         tree_undirected: Undirected spanning tree (output from tree_search)
@@ -175,6 +182,8 @@ def find_optimal_root(
         use_T_depth_dist: If True, use T's depth distribution as target (default: False).
                          Train mode: ignored (always uses T).
                          Eval mode: must be explicitly enabled.
+        prior_dist: Optional explicit depth histogram (list of counts per depth level).
+                    When provided, overrides use_T_depth_dist.
         verbose: Print progress
 
     Returns:
@@ -209,7 +218,11 @@ def find_optimal_root(
     # Get true depth vector if available
     depth_vector_true_list = None
     true_root = None
-    if true_tree is not None and use_T_depth_dist:
+
+    # Priority 1: explicit prior_dist overrides everything
+    if prior_dist is not None:
+        depth_vector_true_list = list(prior_dist)
+    elif true_tree is not None and use_T_depth_dist:
         # Try to find a natural root (in_degree=0 if directed, else use node 0)
         if true_tree.is_directed():
             true_roots = [n for n in true_tree.nodes() if true_tree.in_degree(n) == 0]
@@ -240,7 +253,7 @@ def find_optimal_root(
 
         # Compute MSE
         if depth_vector_true_list is not None:
-            # Target: use T's depth distribution
+            # Target: prior_dist or T's depth distribution
             mse = compute_depth_mse(depth_vector_pred, depth_vector_true_list)
         elif true_tree is not None:
             # T available but use_T_depth_dist=False: use tree height heuristic
@@ -335,6 +348,40 @@ def compute_directed_recall(
     }
 
 
+def find_rumor_root(tree_undirected: nx.Graph) -> Any:
+    """
+    Select root using rumor centrality (Shah & Zaman 2011).
+
+    The rumor center maximises the probability of being the source under
+    a symmetric SI model on a tree.  Equivalent to the node with maximum
+    rumor centrality R(v) = n! / prod_{subtree sizes rooted at v}.
+
+    Requires the optional `rumor_centrality` module.  Falls back to the
+    tree-height heuristic if the module is unavailable.
+
+    Args:
+        tree_undirected: Undirected spanning tree.
+
+    Returns:
+        The selected root node.
+    """
+    if not _RUMOR_AVAILABLE:
+        raise ImportError(
+            "rumor_centrality module not found.  "
+            "Make sure rumor_centrality.py is importable or install the package."
+        )
+
+    if not nx.is_connected(tree_undirected):
+        # Pick largest component for robustness
+        largest = max(nx.connected_components(tree_undirected), key=len)
+        subgraph = tree_undirected.subgraph(largest).copy()
+    else:
+        subgraph = tree_undirected
+
+    root, _scores = _rumor_estimate_source(subgraph)
+    return root
+
+
 def process_graph(
     entry: Dict[str, Any],
     output_dir: str,
@@ -343,6 +390,8 @@ def process_graph(
     use_T_depth_dist: bool = False,
     verbose: bool = False,
     search_dir_name: str = "search",
+    root_method: str = "depth_prior",
+    prior_dist: Optional[List[float]] = None,
 ) -> Dict[str, Any]:
     """
     Process single graph: find optimal root and evaluate directed tree.
@@ -359,6 +408,10 @@ def process_graph(
         use_T_depth_dist: Use T's depth distribution (train mode: ignored/always True)
         verbose: Print progress
         search_dir_name: Name of search directory (search, search_mst, search_sa, search_mst_sa)
+        root_method: Root selection method: 'depth_prior' (default) or 'rumor'.
+        prior_dist: Optional depth histogram (list of counts per depth level) to use as
+                    external prior instead of computing from T.  Only used when
+                    root_method='depth_prior'.
 
     Returns:
         {
@@ -413,17 +466,30 @@ def process_graph(
         if verbose:
             print(f"\n  {gid}: Testing roots...")
 
-        # Train mode: always use T depth dist (ignore flag)
-        # Eval mode: only use T depth dist if flag explicitly set
-        use_T = (mode == "train") or use_T_depth_dist
+        if root_method == "rumor":
+            optimal_root = find_rumor_root(tree_undirected)
+            root_result = {
+                "root": optimal_root,
+                "depth_mse": None,
+                "depth_vector_pred": None,
+                "depth_vector_true": None,
+                "true_root": None,
+                "all_roots": [],
+            }
+        else:
+            # depth_prior (default)
+            # Train mode: always use T depth dist (ignore flag)
+            # Eval mode: only use T depth dist if flag explicitly set
+            use_T = (mode == "train") or use_T_depth_dist
 
-        root_result = find_optimal_root(
-            tree_undirected,
-            true_tree,
-            use_T_depth_dist=use_T,
-            verbose=verbose,
-        )
-        optimal_root = root_result["root"]
+            root_result = find_optimal_root(
+                tree_undirected,
+                true_tree,
+                use_T_depth_dist=use_T,
+                prior_dist=prior_dist,
+                verbose=verbose,
+            )
+            optimal_root = root_result["root"]
 
         # Create directed tree from optimal root using BFS
         directed_tree = nx.DiGraph(nx.bfs_tree(tree_undirected, optimal_root))
@@ -512,6 +578,8 @@ def process_manifest(
     workers: int = 1,
     verbose: bool = False,
     search_dir_name: str = "search",
+    root_method: str = "depth_prior",
+    prior_dist: Optional[List[float]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Process all graphs in manifest: find optimal roots and evaluate.
@@ -527,6 +595,8 @@ def process_manifest(
         workers: Number of parallel workers (1 = sequential)
         verbose: Print progress
         search_dir_name: Name of search directory (search, search_mst, search_sa, search_mst_sa)
+        root_method: Root selection method: 'depth_prior' (default) or 'rumor'.
+        prior_dist: Optional external depth histogram for 'depth_prior' method.
 
     Returns:
         List of result dicts
@@ -546,7 +616,7 @@ def process_manifest(
 
     if verbose:
         print(
-            f"Processing {len(entries)} graphs in {mode} mode (use_T_depth_dist={use_T_depth_dist})"
+            f"Processing {len(entries)} graphs in {mode} mode (use_T_depth_dist={use_T_depth_dist}, root_method={root_method})"
         )
 
     # Sequential or parallel processing
@@ -563,6 +633,8 @@ def process_manifest(
                 use_T_depth_dist=use_T_depth_dist,
                 verbose=verbose,
                 search_dir_name=search_dir_name,
+                root_method=root_method,
+                prior_dist=prior_dist,
             )
             results.append(result)
     else:
@@ -582,6 +654,8 @@ def process_manifest(
                     use_T_depth_dist,
                     False,  # verbose=False in parallel
                     search_dir_name,
+                    root_method,
+                    prior_dist,
                 )
                 for entry in entries
             ]
@@ -635,6 +709,25 @@ def parse_args():
         help="Use T's depth distribution for root selection (eval mode only; ignored in train mode where it's always used)",
     )
     parser.add_argument(
+        "--root-method",
+        choices=["depth_prior", "rumor"],
+        default="depth_prior",
+        help=(
+            "Root selection method: 'depth_prior' (default) minimises MSE against a "
+            "depth histogram (from T or --prior-path); 'rumor' uses Shah & Zaman (2011) "
+            "rumor centrality (requires rumor_centrality module)."
+        ),
+    )
+    parser.add_argument(
+        "--prior-path",
+        default=None,
+        help=(
+            "Path to a JSON file containing an explicit depth histogram "
+            "(list of counts per depth level) used as the prior for depth_prior root selection. "
+            "When provided, overrides use_T_depth_dist."
+        ),
+    )
+    parser.add_argument(
         "--search-dir",
         default="search",
         help="Name of search directory (search, search_mst, search_sa, search_mst_sa)",
@@ -672,9 +765,24 @@ def main():
     print(f"  Collection: {args.collection}")
     print(f"  Output dir: {args.output_dir}")
     print(f"  Mode: {args.mode}")
+    print(f"  Root method: {args.root_method}")
     print(f"  Use T depth dist: {args.use_T_depth_dist}")
+    if args.prior_path:
+        print(f"  Prior path: {args.prior_path}")
     print(f"  Workers: {args.workers}")
     print(f"  Search dir: {args.search_dir}")
+
+    # Load optional external prior distribution
+    prior_dist = None
+    if args.prior_path:
+        with open(args.prior_path) as f:
+            prior_dist = json.load(f)
+        if not isinstance(prior_dist, list):
+            raise ValueError(
+                f"--prior-path must be a JSON file containing a list of numbers, "
+                f"got {type(prior_dist).__name__}"
+            )
+        prior_dist = [float(x) for x in prior_dist]
 
     results = process_manifest(
         args.manifest,
@@ -685,6 +793,8 @@ def main():
         workers=args.workers,
         verbose=args.verbose,
         search_dir_name=args.search_dir,
+        root_method=args.root_method,
+        prior_dist=prior_dist,
     )
 
     # Summary
@@ -699,8 +809,10 @@ def main():
 
     successes = [r for r in results if not r["error"]]
     if successes:
-        avg_mse = np.mean([r["depth_mse"] for r in successes])
-        print(f"  Average depth MSE: {avg_mse:.4f}")
+        mses = [r["depth_mse"] for r in successes if r["depth_mse"] is not None]
+        if mses:
+            avg_mse = np.mean(mses)
+            print(f"  Average depth MSE: {avg_mse:.4f}")
 
         undirected_recalls = [
             r["undirected_recall"]
