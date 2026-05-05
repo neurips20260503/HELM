@@ -84,7 +84,6 @@ For rate-limited environments:
 """
 
 import argparse
-import wikipediaapi
 import networkx as nx
 import os
 import pickle
@@ -93,6 +92,12 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import time
+
+try:
+    import wikipediaapi
+    _wiki_available = True
+except ImportError:
+    _wiki_available = False
 
 
 def save_graph(graph, output_path, name, meta_extra=None):
@@ -503,6 +508,14 @@ def main():
     """
 
     default_output_path = "data/wiki"
+
+    if not _wiki_available:
+        print(
+            "ERROR: wikipediaapi is required for Wikipedia extraction.\n"
+            "Install with: pip install wikipediaapi"
+        )
+        import sys
+        sys.exit(1)
 
     parser = argparse.ArgumentParser(
         description="Generate hierarchy tree and entity graph from Wikipedia categories."
