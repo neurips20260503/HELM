@@ -26,10 +26,46 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+import matplotlib
+
+matplotlib.use("Agg")  # Non-interactive backend
+import matplotlib.pyplot as plt
+
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from torch.utils.data import Dataset, DataLoader
+
+    # Use Tensor Cores with reduced precision accumulation for speed/memory
+    try:
+        torch.set_float32_matmul_precision("medium")
+    except Exception:
+        pass
+
+    from torch_geometric.data import Data, Batch
+    from torch_geometric.nn import GINEConv
+    from torch_geometric.utils import dropout_edge
+    import pytorch_lightning as pl
+    from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+    from pytorch_lightning.loggers import TensorBoardLogger
+    import optuna
+    from optuna.integration import PyTorchLightningPruningCallback
+
+    _gnn_deps_available = True
+    _gnn_deps_error = None
+except ImportError as _e:
+    _gnn_deps_available = False
+    _gnn_deps_error = str(_e)
+
+# GNN class definitions use torch/pl at module level — fail early with a helpful message
+if not _gnn_deps_available:
+    raise ImportError(
+        f"GNN dependencies not available ({_gnn_deps_error}).\n"
+        "Install with: pip install torch pytorch-lightning torch-geometric optuna\n"
+        "Skip this module entirely if you only need the XGBoost/LightGBM pipeline."
+    )
+
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
@@ -39,25 +75,6 @@ from sklearn.metrics import (
     recall_score,
     roc_curve,
 )
-import matplotlib
-
-matplotlib.use("Agg")  # Non-interactive backend
-import matplotlib.pyplot as plt
-
-# Use Tensor Cores with reduced precision accumulation for speed/memory
-try:
-    torch.set_float32_matmul_precision("medium")
-except Exception:
-    pass
-
-from torch_geometric.data import Data, Batch
-from torch_geometric.nn import GINEConv
-from torch_geometric.utils import dropout_edge
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
-from pytorch_lightning.loggers import TensorBoardLogger
-import optuna
-from optuna.integration import PyTorchLightningPruningCallback
 from src.utils import load_graph
 from datetime import datetime
 
@@ -284,7 +301,9 @@ def pool_features_and_samples(
     return pooled, feature_cols, scaler, graphs
 
 
-def sample_pooled_edges(pooled_df, graphs, feature_cols, fraction_pos=0.1, min_pos=10, seed=DEFAULT_SEED):
+def sample_pooled_edges(
+    pooled_df, graphs, feature_cols, fraction_pos=0.1, min_pos=10, seed=DEFAULT_SEED
+):
     """
     Sample positive (in tree T) and negative (in graph G but not T) edges.
 
@@ -919,7 +938,7 @@ def train_with_optuna(
     hyperparams_config=None,
 ):
     """Train GNN with optional Optuna hyperparameter optimization.
-    
+
     If optuna_enabled=False, requires hyperparams_config with explicit params.
     """
     set_seed(seed)
@@ -950,7 +969,9 @@ def train_with_optuna(
     print("STEP 2: SAMPLING POSITIVE/NEGATIVE EDGES")
     print("=" * 70)
 
-    X, y, sampled_edges = sample_pooled_edges(pooled_df, graphs_list, feature_cols, seed=seed)
+    X, y, sampled_edges = sample_pooled_edges(
+        pooled_df, graphs_list, feature_cols, seed=seed
+    )
 
     print(f"Total sampled edges: {len(y)}")
     print(f"  Positive: {sum(y)} ({100*sum(y)/len(y):.1f}%)")
@@ -1351,19 +1372,21 @@ def train_with_optuna(
     if not optuna_enabled:
         # BRANCH: No Optuna - load hyperparameters from config file
         print("⚠️  Optuna disabled - loading hyperparameters from config")
-        
+
         if hyperparams_config is None:
             raise ValueError(
                 "Optuna disabled but --hyperparams-config not provided. "
                 "Usage: --optuna-disabled --hyperparams-config path/to/params.json"
             )
-        
+
         if not os.path.exists(hyperparams_config):
-            raise FileNotFoundError(f"Hyperparams config not found: {hyperparams_config}")
-        
+            raise FileNotFoundError(
+                f"Hyperparams config not found: {hyperparams_config}"
+            )
+
         with open(hyperparams_config, "r") as f:
             best_params = json.load(f)
-        
+
         # Validate required fields for GNN
         required_fields = {
             "hidden_dim",
@@ -1380,10 +1403,10 @@ def train_with_optuna(
                 f"Required: {required_fields}\n"
                 f"Config has: {set(best_params.keys())}"
             )
-        
+
         print(f"✅ Loaded hyperparameters from {hyperparams_config}")
         print(f"Hyperparameters: {json.dumps(best_params, indent=2)}")
-        
+
     else:
         # BRANCH: Optuna enabled - hyperparameter search
         print("Running Optuna hyperparameter search...")
@@ -1416,7 +1439,7 @@ def train_with_optuna(
             json.dump(study.best_params, f, indent=4)
 
         best_params = study.best_params
-        
+
         # Save optuna results for later reference
         optuna_results = {
             "best_trial": study.best_trial.number,
@@ -1631,7 +1654,13 @@ def train_with_optuna(
 
 
 def score_manifest(
-    manifest_path, collection, output_dir, device, model_dir=None, evaluate=False, seed=DEFAULT_SEED
+    manifest_path,
+    collection,
+    output_dir,
+    device,
+    model_dir=None,
+    evaluate=False,
+    seed=DEFAULT_SEED,
 ):
     """Score all graphs in manifest and optionally evaluate if labels (T.pkl) available.
 
