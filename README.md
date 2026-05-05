@@ -6,10 +6,10 @@ This package contains the source code and sample data for:
 
 > **HELM: Hierarchy via Edge Learning and MST**  
 
-
 ## Dependencies
 
 **Core (required):**
+
 ```bash
 pip install networkx numpy pandas scikit-learn xgboost lightgbm optuna optuna-integration[xgboost,lightgbm,pytorch-lightning]
 pip install graphMeasures
@@ -17,16 +17,19 @@ pip install --upgrade networkx  # Important: upgrade after graphMeasures
 ```
 
 **GNN support (optional):**
+
 ```bash
 pip install torch pytorch-lightning torch-geometric
 ```
 
 **Wikipedia extraction (optional):**
+
 ```bash
 pip install wikipediaapi
 ```
 
 **Optuna for hyperparameter tuning (optional):**
+
 ```bash
 pip install optuna
 ```
@@ -61,6 +64,7 @@ python -m src.algorithms.edge_scores \
 ```
 
 **Tested configs available:**
+
 - `configs/xgb_wiki.json` (Wikipedia)
 - `configs/xgb_microbiome.json` (Microbiome)  
 - `configs/xgb_memetracker.json` (MemeTracker)
@@ -80,11 +84,13 @@ python -m src.algorithms.tree_search \
 ```
 
 **Tested configs available:**
+
 - `configs/sa_wiki.json` (Wikipedia)
 - `configs/sa_microbiome.json` (Microbiome)
 - `configs/sa_memetracker.json` (MemeTracker)
 
 **Key parameters:**
+
 - `--max-iter`: Number of iterations (default: 5M, use 0 for MST-only without SA search)
 - `--init-method`: Tree initialization (`mst`, `positive_edges`, `empty`)
 
@@ -238,6 +244,7 @@ python -m src.scripts.optuna_tree_search \
 Simulated Annealing for hierarchy reconstruction:
 
 **Features:**
+
 - Initial tree from MST based on scores or union find tree based on set of known edges
 - 3 move types: NNI, SPR, TBR
 - Adaptive boldness (TBR/SPR ratio increases during stagnation)
@@ -267,8 +274,16 @@ python -m src.algorithms.tree_search \
 
 Optimal root selection for tree directionality:
 
-**Algorithm:** BFS-based, tests all candidate roots  
-**Criterion:** Minimizes MSE between predicted and ground-truth depth distributions   
+**Root selection methods:**
+
+- `depth_prior` (default): BFS-based, tests all candidate roots, minimises MSE against a depth histogram
+- `rumor`: Shah & Zaman (2011) rumor centrality — prior-free (implemented in `src/algorithms/rumor_centrality.py`)
+
+**Depth histogram sources (depth_prior method, in priority order):**
+
+1. `--prior-path <file.json>` — explicit external prior (JSON list of counts per depth level)
+2. `--use-T-depth-dist` — inferred from the ground-truth tree `T` at eval time
+3. Fallback: tree-height heuristic (prefers balanced/shallow trees)
 
 **Outputs per graph:**
 
@@ -280,15 +295,30 @@ Optimal root selection for tree directionality:
 **Usage:**
 
 ```bash
-# Find optimal root (single graph)
+# Default depth-prior method (single graph)
 python -m src.algorithms.optimal_root \
   --gid ID --collection wiki --output-dir . --mode train
 
-# Batch processing
+# Batch with external prior
 python -m src.algorithms.optimal_root \
   --manifest manifests/manifest_10_wiki_test.json \
-  --collection wiki --output-dir . --mode eval
+  --collection wiki --output-dir . --mode eval \
+  --prior-path configs/depth_prior_wiki.json
+
+# Rumor centrality root selection
+python -m src.algorithms.optimal_root \
+  --manifest manifests/manifest_10_wiki_test.json \
+  --collection wiki --output-dir . --mode eval \
+  --root-method rumor
 ```
+
+### `src/algorithms/rumor_centrality.py`
+
+Rumor centrality computation (Shah & Zaman 2011):
+
+- `estimate_source_exact(G)` — returns `(best_node, scores_dict)` for a connected undirected tree
+- Uses adjacency arrays + BFS for exact log-score per candidate root
+- Used internally by `optimal_root.py` when `--root-method rumor` is set
 
 ### `src/utils.py`
 
@@ -321,4 +351,3 @@ Utility functions:
   }
 ]
 ```
-
