@@ -8,9 +8,6 @@ import sys
 import numpy as np
 import pandas as pd
 import networkx as nx
-import optuna
-from optuna.integration import XGBoostPruningCallback
-from optuna.integration.lightgbm import LightGBMPruningCallback
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     accuracy_score,
@@ -21,8 +18,28 @@ from sklearn.metrics import (
 )
 from sklearn.preprocessing import StandardScaler
 import xgboost as xgb
-import lightgbm as lgb
 from src.utils import load_graph
+
+try:
+    import optuna
+    from optuna.integration import XGBoostPruningCallback
+    _optuna_available = True
+except ImportError:
+    optuna = None
+    XGBoostPruningCallback = None
+    _optuna_available = False
+
+try:
+    import lightgbm as lgb
+    try:
+        from optuna.integration.lightgbm import LightGBMPruningCallback
+    except (ImportError, AttributeError):
+        LightGBMPruningCallback = None
+    _lgb_available = True
+except ImportError:
+    lgb = None
+    LightGBMPruningCallback = None
+    _lgb_available = False
 
 
 # ------------------------
@@ -465,6 +482,11 @@ def _build_model(model_type, params):
     if model_type == "xgb":
         return xgb.XGBClassifier(**params)
     else:
+        if not _lgb_available:
+            raise ImportError(
+                "lightgbm is required for the 'lgb' model type. "
+                "Install with: pip install lightgbm"
+            )
         return lgb.LGBMClassifier(**params)
 
 
@@ -711,6 +733,11 @@ def train_model(
     # 1. MedianPruner: Prunes bad trials during training (trial-level)
     # 2. PlateauCallback: Stops entire study when plateau detected (study-level)
     # 3. TPESampler with seed for reproducibility
+    if not _optuna_available:
+        raise ImportError(
+            "optuna is required for hyperparameter tuning. "
+            "Install with: pip install optuna 'optuna-integration[xgboost,lightgbm]'"
+        )
     study = optuna.create_study(
         direction="maximize",
         sampler=optuna.samplers.TPESampler(seed=seed),  # Seed Optuna's sampler!
