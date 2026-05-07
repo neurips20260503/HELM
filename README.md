@@ -78,7 +78,7 @@ python -m src.algorithms.edge_scores \
 
 **Output:** `outputs/{collection}/model/best_model.pkl` and edge scores per graph
 
-### Step 3: Hierarchy Reconstruction (Tree Search)
+### Step 3a: Hierarchy Reconstruction via Simulated Annealing
 
 ```bash
 # Run tree search with tested hyperparameters
@@ -103,7 +103,34 @@ python -m src.algorithms.tree_search \
 
 **Output:** `outputs/{collection}/{graph_id}/search/tree.pkl`
 
-### Step 4: Root Selection and Directionality
+### Step 3b (alternative): Edmonds Directed Reconstruction
+
+Replaces both Step 3a and Step 4 — structure and root are jointly optimised in a single call to Edmonds' minimum spanning arborescence algorithm.
+
+```bash
+# Directed graph (wiki — G is already a DiGraph)
+python -m src.algorithms.edmonds_search \
+  --manifest manifests/manifest_10_wiki_test.json \
+  --collection wiki \
+  --output-dir . \
+  --results-csv outputs/wiki/edmonds_results.csv \
+  --workers 4
+
+# Undirected graph (microbiome, memetracker) — use --directed-mode
+# Requires score CSV produced with --directed-mode (both (u,v) and (v,u) rows)
+python -m src.algorithms.edmonds_search \
+  --manifest manifests/manifest_10_microbiome_test.json \
+  --collection microbiome \
+  --output-dir . \
+  --directed-mode \
+  --workers 4
+```
+
+**Output:** `outputs/{collection}/{graph_id}/edmonds/arborescence.pkl`
+
+### Step 4: Root Selection and Directionality (SA path only)
+
+Not needed when using Edmonds (Step 3b). Required only after Step 3a.
 
 ```bash
 # Find optimal root using depth distribution matching
@@ -231,17 +258,44 @@ Graph Neural Network edge scoring (**requires GNN optional dependencies**, see D
 - Multi-graph training with train/val/test splits
 - GPU acceleration support
 
+**Key flags:**
+
+- `--directed-mode`: treat undirected graphs as bidirected — doubles edges with signed diff features so Edmonds can pick direction. Required for microbiome and memetracker when combining with `edmonds_search.py --directed-mode`.
+- `--gpu_id`: GPU to use (`0`, `1`, …); `-1` = auto-select (CPU if no GPU available).
+- `--max_trials`: number of Optuna trials (default 30).
+- `--optuna-disabled --hyperparams-config <file.json>`: skip search and use a fixed config.
+
 **Usage:**
 
 ```bash
-# Train GNN with hyperparameter search
-python -m src.scripts.optuna_tree_search \
+# Train GNN on wiki (directed graph, no --directed-mode needed)
+python -m src.algorithms.edge_scores_gnn \
   --mode train \
   --train_manifest manifests/manifest_10_wiki_train.json \
+  --test_manifest manifests/manifest_10_wiki_test.json \
   --collection wiki \
   --output_dir . \
   --max_trials 30 \
   --gpu_id 0
+
+# Train GNN on microbiome/memetracker (undirected → bidirected for Edmonds)
+python -m src.algorithms.edge_scores_gnn \
+  --mode train \
+  --train_manifest manifests/manifest_10_microbiome_train.json \
+  --test_manifest manifests/manifest_10_microbiome_test.json \
+  --collection microbiome \
+  --output_dir . \
+  --directed-mode \
+  --max_trials 30 \
+  --gpu_id 0
+
+# Score only (use a pre-trained model)
+python -m src.algorithms.edge_scores_gnn \
+  --mode score \
+  --test_manifest manifests/manifest_10_wiki_test.json \
+  --collection wiki \
+  --output_dir . \
+  --model_dir outputs/wiki/gnn/model
 ```
 
 ### `src/algorithms/tree_search.py`
@@ -316,6 +370,45 @@ python -m src.algorithms.optimal_root \
   --collection wiki --output-dir . --mode eval \
   --root-method rumor
 ```
+
+### `src/algorithms/edmonds_search.py`
+
+Edmonds' minimum spanning arborescence as a single-step directed hierarchy reconstruction:
+
+**How it differs from the SA pipeline:**
+
+- SA pipeline: undirected graph → MST → separate root selection → directed arborescence (two steps)
+- Edmonds pipeline: directed graph → minimum spanning arborescence in one step (structure and root jointly optimised)
+
+**Edge weights:** `w(u,v) = -log(score(u,v) + 1e-9)` — minimising weight is equivalent to maximising the product of scores (MLE arborescence).
+
+**Directed vs undirected graphs:**
+
+- Wiki: G is already a DiGraph — use as-is, scores are asymmetric (signed diff features).
+- Microbiome / MemeTracker: G is undirected — pass `--directed-mode` (and train scores with `--directed-mode` too) to double edges and give Edmonds both directions to choose from.
+
+**Usage:**
+
+```bash
+# Wiki (directed graph)
+python -m src.algorithms.edmonds_search \
+  --manifest manifests/manifest_10_wiki_test.json \
+  --collection wiki \
+  --output-dir . \
+  --results-csv outputs/wiki/edmonds_results.csv \
+  --workers 4
+
+# Microbiome / MemeTracker (undirected → bidirected)
+python -m src.algorithms.edmonds_search \
+  --manifest manifests/manifest_10_microbiome_test.json \
+  --collection microbiome \
+  --output-dir . \
+  --directed-mode \
+  --results-csv outputs/microbiome/edmonds_results.csv \
+  --workers 4
+```
+
+**Output:** `outputs/{collection}/{graph_id}/edmonds/arborescence.pkl` and `edmonds_results.json`
 
 ### `src/algorithms/rumor_centrality.py`
 
