@@ -23,6 +23,7 @@ from src.utils import load_graph
 try:
     import optuna
     from optuna.integration import XGBoostPruningCallback
+
     _optuna_available = True
 except ImportError:
     optuna = None
@@ -31,6 +32,7 @@ except ImportError:
 
 try:
     import lightgbm as lgb
+
     try:
         from optuna.integration.lightgbm import LightGBMPruningCallback
     except (ImportError, AttributeError):
@@ -182,6 +184,23 @@ def parse_args():
         default=42,
         help="Random seed for reproducibility (sets Python and NumPy RNG seeds) [default: 42]",
     )
+    parser.add_argument(
+        "--directed-mode",
+        dest="directed_mode",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable directed-mode training/scoring for undirected graphs "
+            "(e.g. memetracker, microbiome).  Each undirected edge (u,v) is "
+            "doubled into (u,v) and (v,u) with signed diff node features so "
+            "the model learns structural direction cues.  Labels treat only "
+            "the correct directed edge in T as positive.  The output score CSV "
+            "contains one score per directed edge (2x rows vs standard mode), "
+            "which Edmonds' arborescence uses to recover both tree structure "
+            "and edge direction in one step.  Requires --output-dir to differ "
+            "from the standard outputs/ dir to avoid overwriting existing results."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -193,7 +212,7 @@ def prepare_features(node_df, edge_df, use_abs_diff: bool = False):
     Does NOT scale - scaling is done once during training or loaded from saved scaler.
     """
     node_df.index.name = "node"
-    
+
     # Extract source and target nodes from edge index
     # Handle both MultiIndex and tuple index cases
     if isinstance(edge_df.index, pd.MultiIndex):
@@ -203,19 +222,19 @@ def prepare_features(node_df, edge_df, use_abs_diff: bool = False):
         # Index is tuples: extract u and v from each tuple
         sources = pd.Index([e[0] for e in edge_df.index])
         targets = pd.Index([e[1] for e in edge_df.index])
-    
+
     # Vectorized computation: get node feature vectors for source and target nodes
     u_vecs = node_df.loc[sources].values  # All source nodes
     v_vecs = node_df.loc[targets].values  # All target nodes
-    
+
     # Compute avg and diff vectors for all edges at once
     avg_vec = (u_vecs + v_vecs) / 2
     diff_raw = (u_vecs - v_vecs) / 2
     diff_vec = np.abs(diff_raw) if use_abs_diff else diff_raw
-    
+
     # Concatenate horizontally
     combined = np.concatenate([avg_vec, diff_vec], axis=1)
-    
+
     avg_diff_df = pd.DataFrame(
         combined,
         index=edge_df.index,
@@ -374,8 +393,24 @@ def score_graph(model, scaler, meta, node_df, edge_df, out_path):
         out_path: Where to write edge_scores.csv
 
     Returns:
-        DataFrame with columns [source, target, score]
+        DataFrame with columns [source, target, score].  When the model was
+        trained with directed_mode=True the CSV contains two rows per original
+        undirected edge -- one for each direction -- so that Edmonds'
+        arborescence can pick the correct orientation.
     """
+    # In directed_mode the model expects bidirected (doubled) edge input
+    directed_mode = bool(meta.get("directed_mode")) if meta else False
+    if directed_mode:
+        # Ensure source/target columns exist before mirroring
+        if "source" not in edge_df.columns or "target" not in edge_df.columns:
+            edge_df = edge_df.reset_index()
+            if "edge" in edge_df.columns:
+                edge_df["source"] = [e[0] for e in edge_df["edge"]]
+                edge_df["target"] = [e[1] for e in edge_df["edge"]]
+        edge_df.index = pd.Index(list(zip(edge_df["source"], edge_df["target"])))
+        mirror = _mirror_edge_df(edge_df)
+        edge_df = pd.concat([edge_df, mirror])
+
     # Compute avg/diff features (unscaled)
     use_abs_diff = bool(meta.get("use_abs_diff")) if meta else False
     processed_edge_df, all_cols = prepare_features(
@@ -817,8 +852,39 @@ def train_model(
 # ------------------------
 
 
-def pool_features_and_samples(manifest_path, collection, base_dir):
+def _mirror_edge_df(edge_df: "pd.DataFrame") -> "pd.DataFrame":
+    """Return a copy of edge_df with source and target swapped.
+
+    Symmetric edge-level features (e.g. edge_betweenness) are preserved as-is
+    because they are the same regardless of direction.  The index is rebuilt as
+    (target, source) tuples so it is compatible with prepare_features().
+    """
+    mirrored = edge_df.copy()
+    # swap source / target columns
+    mirrored["source"], mirrored["target"] = (
+        edge_df["target"].values,
+        edge_df["source"].values,
+    )
+    # rebuild tuple index — use names=None to avoid MultiIndex promotion crash
+    # when the current index has a scalar name (e.g. "edge")
+    mirrored.index = pd.Index(
+        list(zip(mirrored["source"], mirrored["target"])), name=None
+    )
+    return mirrored
+
+
+def pool_features_and_samples(
+    manifest_path, collection, base_dir, directed_mode: bool = False
+):
     """Load all features from manifest, pool them, and sample edges for training.
+
+    Parameters
+    ----------
+    directed_mode : bool
+        When True, undirected graphs are treated as bidirected: every edge
+        (u, v) is doubled into (u, v) and (v, u) with signed diff features
+        (use_abs_diff=False).  Labels match only the correct directed edge in T.
+        Use this when you want Edmonds' arborescence on an undirected dataset.
 
     Returns:
         pooled_df: DataFrame with all features and 'graph_id' column
@@ -873,13 +939,33 @@ def pool_features_and_samples(manifest_path, collection, base_dir):
         if entry.get("T_path") and os.path.exists(entry["T_path"]):
             T = load_graph(entry["T_path"])
 
-        # Decide on abs diff for undirected graphs
-        if G is not None:
-            use_abs_diff = not G.is_directed()
-        elif T is not None:
-            use_abs_diff = not T.is_directed()
+        # In directed_mode, convert undirected G to bidirected and double edge rows
+        if directed_mode and G is not None and not G.is_directed():
+            # Reset index so source/target columns are accessible for mirroring
+            edge_df_reset = (
+                edge_df.reset_index(drop=True)
+                if edge_df.index.name not in ("source", "target", None)
+                else edge_df.copy()
+            )
+            # Rebuild with explicit source/target columns from index if needed
+            if "source" not in edge_df_reset.columns:
+                edge_df_reset["source"] = [i[0] for i in edge_df.index]
+                edge_df_reset["target"] = [i[1] for i in edge_df.index]
+            edge_df_reset.index = pd.Index(
+                list(zip(edge_df_reset["source"], edge_df_reset["target"]))
+            )
+            mirror = _mirror_edge_df(edge_df_reset)
+            edge_df = pd.concat([edge_df_reset, mirror])
+            G = G.to_directed()  # adds both (u,v) and (v,u)
+            use_abs_diff = False  # signed diffs give directional signal
         else:
-            use_abs_diff = False
+            # Decide on abs diff for undirected graphs
+            if G is not None:
+                use_abs_diff = not G.is_directed()
+            elif T is not None:
+                use_abs_diff = not T.is_directed()
+            else:
+                use_abs_diff = False
         use_abs_diff_collection = use_abs_diff_collection or use_abs_diff
 
         # Prepare features
@@ -1095,19 +1181,35 @@ def train_manifest(
     seed=42,
     optuna_enabled=True,
     hyperparams_config=None,
+    directed_mode: bool = False,
 ):
     """Train a pooled model on a manifest collection.
 
     Loads features from all graphs, pools them, samples edges, trains model,
     and saves all artifacts to base/collection/model/.
+
+    Parameters
+    ----------
+    directed_mode : bool
+        When True, undirected graphs are bidirected before feature computation:
+        every edge (u,v) becomes two rows (u,v) and (v,u) with signed diff
+        features, and a label of 1 is assigned only to the correctly directed
+        edge in T.  The resulting score CSV has one score per directed edge so
+        Edmonds' arborescence can recover both structure and direction in one
+        step.  Does not affect already-directed graphs (e.g. wiki).
     """
     pooled_df, feature_cols, _, graphs = pool_features_and_samples(
-        manifest_path, collection, base_dir
+        manifest_path, collection, base_dir, directed_mode=directed_mode
     )
 
-    # Determine if any graph in collection is undirected
-    use_abs_diff_collection = any(
-        (G and not G.is_directed()) or (T and not T.is_directed()) for _, G, T in graphs
+    # Determine if any graph in collection is undirected (after possible conversion)
+    # When directed_mode=True, G has been converted to DiGraph inside pool_features_and_samples
+    use_abs_diff_collection = (
+        any(
+            (G and not G.is_directed()) or (T and not T.is_directed())
+            for _, G, T in graphs
+        )
+        and not directed_mode
     )
     X_raw, y, sampled_edges = sample_pooled_edges(pooled_df, graphs, feature_cols)
 
@@ -1230,6 +1332,7 @@ def train_manifest(
         "collection": collection,
         "model_type": model_type,
         "use_abs_diff": use_abs_diff_collection,
+        "directed_mode": directed_mode,
     }
     save_model_artifacts(model_dir, model, scaler, meta, model_type)
 
@@ -1281,6 +1384,11 @@ def train_manifest(
 def score_manifest(manifest_path, collection, base_dir, model_dir):
     """Score all graphs in a manifest using a trained model.
 
+    Features are always loaded from the paths recorded in each manifest entry
+    (node_features_path / edge_features_path) so that base_dir can be a
+    different directory than where the features were originally computed.
+    Score CSVs are written under base_dir/{collection}/{gid}/scores/.
+
     Loads model once, then scores each graph individually.
     Returns list of output paths.
     """
@@ -1301,12 +1409,31 @@ def score_manifest(manifest_path, collection, base_dir, model_dir):
     written = []
     for entry in entries:
         gid = entry["graph_id"]
+
+        # Load features from the paths stored in the manifest entry so this
+        # works correctly when base_dir differs from the original output dir.
+        node_path = entry.get("node_features_path")
+        edge_path = entry.get("edge_features_path")
+        if (
+            node_path
+            and edge_path
+            and os.path.exists(node_path)
+            and os.path.exists(edge_path)
+        ):
+            node_df = pd.read_csv(node_path)
+            edge_df = pd.read_csv(edge_path)
+            if "node" in node_df.columns:
+                node_df = node_df.set_index("node")
+            if "source" in edge_df.columns and "target" in edge_df.columns:
+                edge_df["edge"] = list(zip(edge_df["source"], edge_df["target"]))
+                edge_df = edge_df.set_index("edge")
+        else:
+            # Fallback: derive from base_dir (original behaviour)
+            graph_dir = get_graph_dir(base_dir, collection, gid)
+            node_df, edge_df = load_features(graph_dir)
+
+        # Score — output always goes under base_dir so a new dir is respected
         graph_dir = get_graph_dir(base_dir, collection, gid)
-
-        # Load features
-        node_df, edge_df = load_features(graph_dir)
-
-        # Score
         out_path = os.path.join(graph_dir, SCORE_DIR, EDGE_SCORES)
         score_graph(model, scaler, meta, node_df, edge_df, out_path)
         written.append(out_path)
@@ -1399,6 +1526,7 @@ def main():
         seed=args.seed,
         optuna_enabled=args.optuna_enabled,
         hyperparams_config=args.hyperparams_config,
+        directed_mode=args.directed_mode,
     )
 
 
