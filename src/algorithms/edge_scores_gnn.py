@@ -76,6 +76,7 @@ from sklearn.metrics import (
     roc_curve,
 )
 from src.utils import load_graph
+from src.algorithms.edge_scores import _mirror_edge_df
 from datetime import datetime
 
 DEFAULT_SEED = 42
@@ -180,7 +181,12 @@ def load_features(node_path, edge_path):
 
 
 def pool_features_and_samples(
-    manifest_path, collection, base_dir, skip_shortest_path=False, seed=DEFAULT_SEED
+    manifest_path,
+    collection,
+    base_dir,
+    skip_shortest_path=False,
+    seed=DEFAULT_SEED,
+    directed_mode=False,
 ):
     """
     Pool features from all graphs in manifest for multi-graph training.
@@ -242,6 +248,16 @@ def pool_features_and_samples(
 
         # Use frozensets if either graph is undirected
         use_abs_diff = G_is_undirected or T_is_undirected
+
+        # In directed_mode, double edges for directional signal
+        if directed_mode and G_is_undirected:
+            if "source" not in edge_df.columns or "target" not in edge_df.columns:
+                edge_df = edge_df.reset_index()
+            edge_df.index = pd.Index(list(zip(edge_df["source"], edge_df["target"])))
+            mirror = _mirror_edge_df(edge_df)
+            edge_df = pd.concat([edge_df, mirror])
+            G = G.to_directed()
+            use_abs_diff = False
 
         # Filter node_df BEFORE prepare_features if skip_shortest_path is set
         if skip_shortest_path:
@@ -936,6 +952,7 @@ def train_with_optuna(
     seed=DEFAULT_SEED,
     optuna_enabled=True,
     hyperparams_config=None,
+    directed_mode=False,
 ):
     """Train GNN with optional Optuna hyperparameter optimization.
 
@@ -959,6 +976,7 @@ def train_with_optuna(
         output_dir,
         skip_shortest_path=skip_shortest_path_features,
         seed=seed,
+        directed_mode=directed_mode,
     )
 
     # Prepare graphs dict and node features dict
@@ -1189,6 +1207,7 @@ def train_with_optuna(
                 "node_feature_dim": node_feature_dim,
                 "edge_feature_dim": edge_feature_dim,
                 "pos_weight": float(pos_weight),
+                "directed_mode": directed_mode,
             },
             f,
         )
@@ -1661,6 +1680,8 @@ def score_manifest(
     model_dir=None,
     evaluate=False,
     seed=DEFAULT_SEED,
+    directed_mode=False,
+    score_batch_size=256,
 ):
     """Score all graphs in manifest and optionally evaluate if labels (T.pkl) available.
 
@@ -1707,6 +1728,8 @@ def score_manifest(
         node_feature_cols = json.load(f)
     with open(model_dir / "dims.json") as f:
         dims = json.load(f)
+    # Auto-detect directed_mode from saved model metadata (CLI value as fallback)
+    directed_mode = dims.get("directed_mode", directed_mode)
     with open(model_dir / "best_params.json") as f:
         best_params = json.load(f)
 
@@ -1763,8 +1786,20 @@ def score_manifest(
             entry["node_features_path"], entry["edge_features_path"]
         )
 
+        # In directed_mode, double edges so the model scores both directions
+        if directed_mode and not G.is_directed():
+            if "source" not in edge_df.columns or "target" not in edge_df.columns:
+                edge_df = edge_df.reset_index()
+            edge_df.index = pd.Index(list(zip(edge_df["source"], edge_df["target"])))
+            mirror = _mirror_edge_df(edge_df)
+            edge_df = pd.concat([edge_df, mirror])
+            G = G.to_directed()
+
         # Prepare features
-        processed_edge_df, _ = prepare_features(node_df, edge_df)
+        use_abs_diff = not G.is_directed()
+        processed_edge_df, _ = prepare_features(
+            node_df, edge_df, use_abs_diff=use_abs_diff
+        )
 
         # Scale edge features with edge_scaler
         processed_edge_df[feature_cols] = edge_scaler.transform(
@@ -1825,7 +1860,7 @@ def score_manifest(
 
         # Score in batches
         all_scores = []
-        batch_size = 256
+        batch_size = int(score_batch_size)
 
         with torch.no_grad():
             for i in range(0, len(target_edges), batch_size):
@@ -2075,6 +2110,17 @@ def parse_args():
         default=None,
         help="Path to JSON config with hyperparameters (required if --optuna-disabled)",
     )
+    parser.add_argument(
+        "--score-batch-size",
+        type=int,
+        default=256,
+        help="Batch size for score-mode edge inference (default: 256)",
+    )
+    parser.add_argument(
+        "--directed-mode",
+        action="store_true",
+        help="Treat undirected graphs as bidirected: double edges with signed diffs",
+    )
 
     return parser.parse_args()
 
@@ -2177,6 +2223,7 @@ def main():
             seed=args.seed,
             hyperparams_config=args.hyperparams_config,
             optuna_enabled=not args.optuna_disabled,
+            directed_mode=args.directed_mode,
         )
 
         # Score train graphs (no evaluation - already done on test split)
@@ -2191,6 +2238,8 @@ def main():
             model_dir,
             evaluate=False,
             seed=args.seed,
+            directed_mode=args.directed_mode,
+            score_batch_size=args.score_batch_size,
         )
 
         # Score test graphs with evaluation if provided
@@ -2206,6 +2255,8 @@ def main():
                 model_dir,
                 evaluate=True,
                 seed=args.seed,
+                directed_mode=args.directed_mode,
+                score_batch_size=args.score_batch_size,
             )
 
     elif args.mode == "score":
@@ -2219,6 +2270,8 @@ def main():
                 args.model_dir,
                 evaluate=False,
                 seed=args.seed,
+                directed_mode=args.directed_mode,
+                score_batch_size=args.score_batch_size,
             )
 
         if args.test_manifest:
@@ -2231,6 +2284,8 @@ def main():
                 args.model_dir,
                 evaluate=True,
                 seed=args.seed,
+                directed_mode=args.directed_mode,
+                score_batch_size=args.score_batch_size,
             )
 
         if not args.train_manifest and not args.test_manifest:
